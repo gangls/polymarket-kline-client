@@ -8,4 +8,8 @@ export default [
     { languageOptions: { globals: globals.browser } },
     pluginJs.configs.recommended,
     ...tseslint.configs.recommended,
+    {
+        "no-unused-vars": "off",
+        "@typescript-eslint/no-unused-vars": "error",
+    },
 ];

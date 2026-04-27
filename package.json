@@ -1,6 +1,6 @@
 {
-    "name": "@polymarket/real-time-data-client",
-    "version": "1.4.2",
+    "name": "@polymarket/kline-client",
+    "version": "1.0.1",
     "description": "A TypeScript client to receive real time data messages",
     "contributors": [
         {
@@ -22,12 +22,14 @@
     ],
     "license": "MIT",
     "scripts": {
-        "build": "make build",
-        "lint": "make lint",
-        "deploy": "yarn build && npm publish",
-        "format": "prettier --write ."
+        "dev": "ts-node src/index.ts",
+        "build": "tsc",
+        "start": "node dist/index.js"
     },
     "dependencies": {
+        "@prisma/client": "^7.8.0",
+        "bull": "^4.16.5",
+        "ioredis": "^5.10.1",
         "isomorphic-ws": "^5.0.0",
         "tslib": "^2.8.1",
         "ws": "^8.18.1"
