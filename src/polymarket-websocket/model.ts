@@ -39,6 +39,9 @@ export interface SubscriptionMessage {
 
         /** Optional Gamma authentication credentials */
         gamma_auth?: GammaAuth;
+
+        /** Optional flag to enable custom features for the subscription */
+        custom_feature_enabled?: boolean;
     }[];
 }
 

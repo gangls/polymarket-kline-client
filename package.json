@@ -10,16 +10,6 @@
     "bugs": {
         "url": "https://github.com/gangls/polymarket-kline-client/issues"
     },
-    "contributors": [
-        {
-            "name": "Rodrigo Calvo",
-            "url": "https://github.com/poly-rodr"
-        },
-        {
-            "name": "Matt Walker",
-            "url": "https://github.com/mttwlkr"
-        }
-    ],
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
     "files": [

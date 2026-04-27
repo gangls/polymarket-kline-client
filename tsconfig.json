@@ -23,6 +23,8 @@
         "noUnusedParameters": false,
         "resolveJsonModule": true,
         "strictNullChecks": true,
+        "outDir": "./dist",
+        "rootDir": "./src",
         "typeRoots": ["node_modules/@types"],
         "lib": ["es2018", "dom"],
         "skipLibCheck": true,

@@ -160,6 +160,9 @@ export class RealTimeDataClient {
      * @param event Raw WebSocket message data.
      */
     private onMessage = (event: MessageEvent): void => {
+        if (event.type.includes("new")) {
+            console.log("event", event);
+        }
         if (typeof event.data === "string" && event.data.length > 0) {
             if (this.onCustomMessage && event.data.includes("payload")) {
                 const message = JSON.parse(event.data);
