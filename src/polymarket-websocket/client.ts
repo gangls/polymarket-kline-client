@@ -69,17 +69,26 @@ export class RealTimeDataClient {
     /** WebSocket instance */
     private ws!: WebSocket;
 
+    /** Reconnect attempt counter for exponential backoff */
+    private reconnectAttempts: number = 0;
+
+    /** Maximum reconnect attempts before giving up */
+    private readonly maxReconnectAttempts: number = 10;
+
+    /** Whether a reconnect is already scheduled */
+    private reconnectPending: boolean = false;
+
     /**
      * Constructs a new RealTimeDataClient instance.
      * @param args Configuration options for the client.
      */
     constructor(args?: RealTimeDataClientArgs) {
-        this.host = args!.host || DEFAULT_HOST;
-        this.pingInterval = args!.pingInterval || DEFAULT_PING_INTERVAL;
-        this.autoReconnect = args!.autoReconnect || true;
-        this.onCustomMessage = args!.onMessage;
-        this.onConnect = args!.onConnect;
-        this.onStatusChange = args!.onStatusChange;
+        this.host = args?.host || DEFAULT_HOST;
+        this.pingInterval = args?.pingInterval || DEFAULT_PING_INTERVAL;
+        this.autoReconnect = args?.autoReconnect ?? true;
+        this.onCustomMessage = args?.onMessage;
+        this.onConnect = args?.onConnect;
+        this.onStatusChange = args?.onStatusChange;
     }
 
     /**
@@ -102,6 +111,7 @@ export class RealTimeDataClient {
      * Handles WebSocket 'open' event. Executes the `onConnect` callback and starts pinging.
      */
     private onOpen = async () => {
+        this.reconnectAttempts = 0;
         this.ping();
         this.notifyStatusChange(ConnectionStatus.CONNECTED);
         if (this.onConnect) {
@@ -122,9 +132,7 @@ export class RealTimeDataClient {
      */
     private onError = async (err: ErrorEvent) => {
         console.error("error", err);
-        if (this.autoReconnect) {
-            this.connect();
-        }
+        this.reconnectWithBackoff();
     };
 
     /**
@@ -135,9 +143,7 @@ export class RealTimeDataClient {
     private onClose = async (message: CloseEvent) => {
         console.error("disconnected", "code", message.code, "reason", message.reason);
         this.notifyStatusChange(ConnectionStatus.DISCONNECTED);
-        if (this.autoReconnect) {
-            this.connect();
-        }
+        this.reconnectWithBackoff();
     };
 
     /**
@@ -160,18 +166,37 @@ export class RealTimeDataClient {
      * @param event Raw WebSocket message data.
      */
     private onMessage = (event: MessageEvent): void => {
-        if (event.type.includes("new")) {
-            console.log("event", event);
-        }
         if (typeof event.data === "string" && event.data.length > 0) {
-            if (this.onCustomMessage && event.data.includes("payload")) {
+            try {
                 const message = JSON.parse(event.data);
-                this.onCustomMessage(this, message as Message);
-            } else {
-                console.log("onMessage error", { event });
+                if (this.onCustomMessage) {
+                    this.onCustomMessage(this, message as Message);
+                }
+            } catch {
+                console.log("onMessage parse error", event.data);
             }
         }
     };
+
+    /**
+     * Reconnects with exponential backoff.
+     */
+    private reconnectWithBackoff() {
+        if (!this.autoReconnect) return;
+        if (this.reconnectPending) return;
+        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
+            console.error(`Max reconnect attempts (${this.maxReconnectAttempts}) reached, giving up`);
+            return;
+        }
+        this.reconnectPending = true;
+        const backoffMs = Math.min(1000 * Math.pow(2, this.reconnectAttempts), 30000);
+        this.reconnectAttempts++;
+        console.log(`Reconnecting in ${backoffMs}ms (attempt ${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+        setTimeout(() => {
+            this.reconnectPending = false;
+            this.connect();
+        }, backoffMs);
+    }
 
     /**
      * Closes the WebSocket connection.

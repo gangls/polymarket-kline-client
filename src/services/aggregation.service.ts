@@ -322,6 +322,7 @@ export class AggregationService extends EventEmitter {
         const now = Math.floor(Date.now() / 1000);
         let effectiveEnd = Math.min(endTime, now);
         const maxAllowedSeconds = limit * interval;
+
         const maxEnd = startTime + maxAllowedSeconds - 1;
         if (effectiveEnd > maxEnd) effectiveEnd = maxEnd;
         if (startTime > effectiveEnd) return [];
