@@ -26,7 +26,7 @@ export class AggregationService extends EventEmitter {
      * 从订单中获取市场标识
      */
     private getMarketKeyFromOrder(order: OrderMatched): string {
-        return `${order.slug}`;
+        return `${order.slug}:${order.outcomeIndex}`;
     }
 
     /**

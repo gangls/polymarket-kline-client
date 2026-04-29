@@ -26,7 +26,7 @@ export interface GammaAuth {
 export interface SubscriptionMessage {
     subscriptions: {
         /** Topic to subscribe to */
-        topic: string;
+        topic?: string;
 
         /** Type of subscription */
         type: string;
@@ -42,6 +42,7 @@ export interface SubscriptionMessage {
 
         /** Optional flag to enable custom features for the subscription */
         custom_feature_enabled?: boolean;
+        assets_ids?: string[];
     }[];
 }
 
