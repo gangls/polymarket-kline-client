@@ -18,8 +18,8 @@ async function bootstrap() {
 
     // 3. 创建消息处理器（包含 WebSocket 连接 + 批量聚合）
     const processor = new MessageProcessor({
-        batchSize: parseInt(process.env.BATCH_SIZE || "100"),
-        batchTimeoutMs: parseInt(process.env.BATCH_TIMEOUT_MS || "100"),
+        batchSize: parseInt(process.env.BATCH_SIZE || "50000"),
+        batchTimeoutMs: parseInt(process.env.BATCH_TIMEOUT_MS || "1000"),
         enableStreaming: process.env.ENABLE_STREAMING === "true",
     });
 

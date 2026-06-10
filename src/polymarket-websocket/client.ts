@@ -1,7 +1,7 @@
 import WebSocket, { MessageEvent, CloseEvent, ErrorEvent } from "isomorphic-ws";
-import { SubscriptionMessage, Message, ConnectionStatus } from "./model";
+import { WebSocketSubscriptionMessage, Message, ConnectionStatus } from "./model";
 
-const DEFAULT_HOST = "wss://ws-live-data.polymarket.com";
+const DEFAULT_HOST = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 const DEFAULT_PING_INTERVAL = 5000;
 
 /**
@@ -19,7 +19,7 @@ export interface RealTimeDataClientArgs {
      * @param client - The instance of the RealTimeDataClient that received the message.
      * @param message - The message received by the client.
      */
-    onMessage?: (client: RealTimeDataClient, message: Message) => void;
+    onMessage?: (client: RealTimeDataClient, message: unknown) => void;
 
     /**
      * Optional callback function that is called when the client receives a connection status update.
@@ -61,7 +61,7 @@ export class RealTimeDataClient {
     private readonly onConnect?: (client: RealTimeDataClient) => void;
 
     /** Callback function executed when a custom message is received */
-    private readonly onCustomMessage?: (client: RealTimeDataClient, message: Message) => void;
+    private readonly onCustomMessage?: (client: RealTimeDataClient, message: unknown) => void;
 
     /** Callback function executed on a connection status update */
     private readonly onStatusChange?: (status: ConnectionStatus) => void;
@@ -77,6 +77,9 @@ export class RealTimeDataClient {
 
     /** Whether a reconnect is already scheduled */
     private reconnectPending: boolean = false;
+
+    /** Whether the socket was intentionally closed */
+    private closedByUser: boolean = false;
 
     /**
      * Constructs a new RealTimeDataClient instance.
@@ -95,6 +98,7 @@ export class RealTimeDataClient {
      * Establishes a WebSocket connection to the server.
      */
     public connect() {
+        this.closedByUser = false;
         this.notifyStatusChange(ConnectionStatus.CONNECTING);
         this.ws = new WebSocket(this.host);
         if (this.ws) {
@@ -112,7 +116,9 @@ export class RealTimeDataClient {
      */
     private onOpen = async () => {
         this.reconnectAttempts = 0;
-        this.ping();
+        if (!this.isMarketChannel()) {
+            this.ping();
+        }
         this.notifyStatusChange(ConnectionStatus.CONNECTED);
         if (this.onConnect) {
             this.onConnect(this);
@@ -131,6 +137,7 @@ export class RealTimeDataClient {
      * @param err Error object describing the issue.
      */
     private onError = async (err: ErrorEvent) => {
+        if (this.closedByUser) return;
         console.error("error", err);
         this.reconnectWithBackoff();
     };
@@ -141,6 +148,7 @@ export class RealTimeDataClient {
      * @param reason Buffer containing the reason for closure.
      */
     private onClose = async (message: CloseEvent) => {
+        if (this.closedByUser) return;
         console.error("disconnected", "code", message.code, "reason", message.reason);
         this.notifyStatusChange(ConnectionStatus.DISCONNECTED);
         this.reconnectWithBackoff();
@@ -182,6 +190,7 @@ export class RealTimeDataClient {
      * Reconnects with exponential backoff.
      */
     private reconnectWithBackoff() {
+        if (this.closedByUser) return;
         if (!this.autoReconnect) return;
         if (this.reconnectPending) return;
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {
@@ -202,19 +211,25 @@ export class RealTimeDataClient {
      * Closes the WebSocket connection.
      */
     public disconnect() {
+        this.closedByUser = true;
         this.autoReconnect = false;
-        this.ws.close();
+        if (
+            this.ws &&
+            (this.ws.readyState === WebSocket.OPEN || this.ws.readyState === WebSocket.CONNECTING)
+        ) {
+            this.ws.close();
+        }
     }
 
     /**
      * Subscribes to a data stream by sending a subscription message.
      * @param msg Subscription request message.
      */
-    public subscribe(msg: SubscriptionMessage) {
+    public subscribe(msg: WebSocketSubscriptionMessage) {
         if (this.ws.readyState !== WebSocket.OPEN) {
             return console.warn("Socket not open. Ready state is:", this.ws.readyState);
         }
-        this.ws.send(JSON.stringify({ action: "subscribe", ...msg }), (err?: Error) => {
+        this.ws.send(JSON.stringify(this.createSubscribePayload(msg)), (err?: Error) => {
             if (err) {
                 console.error("subscribe error", err);
                 this.ws.close();
@@ -226,12 +241,11 @@ export class RealTimeDataClient {
      * Unsubscribes from a data stream by sending an unsubscription message.
      * @param msg Unsubscription request message.
      */
-    public unsubscribe(msg: SubscriptionMessage) {
+    public unsubscribe(msg: WebSocketSubscriptionMessage) {
         if (this.ws.readyState !== WebSocket.OPEN) {
             return console.warn("Socket not open. Ready state is:", this.ws.readyState);
         }
-        console.log("unsubscribing", { msg });
-        this.ws.send(JSON.stringify({ action: "unsubscribe", ...msg }), (err?: Error) => {
+        this.ws.send(JSON.stringify(this.createUnsubscribePayload(msg)), (err?: Error) => {
             if (err) {
                 console.error("unsubscribe error", err);
                 this.ws.close();
@@ -249,8 +263,55 @@ export class RealTimeDataClient {
         }
         return status;
     }
+
+    private createSubscribePayload(msg: WebSocketSubscriptionMessage): unknown {
+        if (this.isMarketChannel()) {
+            const marketSubscription = normalizeMarketSubscription(msg);
+            if (marketSubscription.operation) {
+                return {
+                    operation: marketSubscription.operation,
+                    assets_ids: marketSubscription.assets_ids,
+                };
+            }
+
+            return marketSubscription;
+        }
+
+        return { action: "subscribe", ...msg };
+    }
+
+    private createUnsubscribePayload(msg: WebSocketSubscriptionMessage): unknown {
+        if (this.isMarketChannel()) {
+            const marketSubscription = normalizeMarketSubscription(msg);
+            return {
+                operation: "unsubscribe",
+                assets_ids: marketSubscription.assets_ids,
+            };
+        }
+
+        return { action: "unsubscribe", ...msg };
+    }
+
+    private isMarketChannel(): boolean {
+        return this.host.includes("/ws/market");
+    }
 }
 
 function delay(ms: number) {
     return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function normalizeMarketSubscription(msg: WebSocketSubscriptionMessage) {
+    if ("assets_ids" in msg) {
+        return msg;
+    }
+
+    const subscription = msg.subscriptions[0];
+    return {
+        assets_ids: subscription.assets_ids ?? [],
+        type: "market" as const,
+        initial_dump: subscription.initial_dump,
+        level: subscription.level,
+        custom_feature_enabled: subscription.custom_feature_enabled,
+    };
 }

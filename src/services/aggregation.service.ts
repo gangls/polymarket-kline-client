@@ -1,12 +1,24 @@
 // src/services/aggregation.service.ts
 import { EventEmitter } from "events";
-import { redisClient, UPSERT_SECOND_BAR_SCRIPT } from "../config/redis";
+import { redisClient, UPSERT_AGGREGATED_SECOND_BAR_SCRIPT, UPSERT_SECOND_BAR_SCRIPT } from "../config/redis";
 import { OrderMatched, SecondBar, AggregationStats, KLine } from "../models/types";
 import { logger } from "../utils/logger";
+
+interface AggregatedOrderBar {
+    marketKey: string;
+    timestamp: number;
+    open: number;
+    high: number;
+    low: number;
+    close: number;
+    volume: number;
+    tradeCount: number;
+}
 
 export class AggregationService extends EventEmitter {
     private readonly MAX_SECOND_BARS = 10000; // 最多返回 10000 条秒级数据
     private readonly ACTIVE_MARKETS_SET = "active_markets"; // Redis Set 名称
+    private readonly knownMarketKeys = new Set<string>();
 
     constructor() {
         super();
@@ -34,7 +46,10 @@ export class AggregationService extends EventEmitter {
      * @param marketKey 市场标识 `${slug}:${outcomeIndex}`
      */
     private async checkAndNotifyNewMarket(marketKey: string): Promise<void> {
+        if (this.knownMarketKeys.has(marketKey)) return;
+
         const isNew = await redisClient.sadd(this.ACTIVE_MARKETS_SET, marketKey);
+        this.knownMarketKeys.add(marketKey);
         if (isNew === 1) {
             this.emit("new_market", marketKey);
             console.log(`🎉 New market discovered: ${marketKey}`);
@@ -85,7 +100,7 @@ export class AggregationService extends EventEmitter {
                 logger.debug(`📊 Second bar updated: ${marketKey} @ ${timestamp}`);
             }
 
-            this.checkAndNotifyNewMarket(marketKey);
+            await this.checkAndNotifyNewMarket(marketKey);
 
             return secondBar;
         } catch (error) {
@@ -103,21 +118,24 @@ export class AggregationService extends EventEmitter {
 
         if (orders.length === 0) return results;
 
+        const aggregatedBars = this.aggregateOrdersBySecond(orders);
         const pipeline = redisClient.pipeline();
         const currentTime = Math.floor(Date.now() / 1000);
 
-        for (const order of orders) {
-            const marketKey = this.getMarketKeyFromOrder(order);
-            const timestamp = order.timestamp;
-            const redisKey = `second_bar:${marketKey}:${timestamp}`;
+        for (const bar of aggregatedBars) {
+            const redisKey = `second_bar:${bar.marketKey}:${bar.timestamp}`;
 
             pipeline.eval(
-                UPSERT_SECOND_BAR_SCRIPT,
+                UPSERT_AGGREGATED_SECOND_BAR_SCRIPT,
                 1,
                 redisKey,
-                order.price.toString(),
-                order.size.toString(),
-                timestamp.toString(),
+                bar.open.toString(),
+                bar.high.toString(),
+                bar.low.toString(),
+                bar.close.toString(),
+                bar.volume.toString(),
+                bar.tradeCount.toString(),
+                bar.timestamp.toString(),
                 currentTime.toString(),
             );
         }
@@ -125,21 +143,19 @@ export class AggregationService extends EventEmitter {
         const execResults = await pipeline.exec();
 
         let newCount = 0;
-        for (let i = 0; i < orders.length; i++) {
-            const order = orders[i];
+        for (let i = 0; i < aggregatedBars.length; i++) {
+            const bar = aggregatedBars[i];
             const result = execResults?.[i]?.[1] as (number | string | null)[];
 
             if (result) {
-                const marketKey = this.getMarketKeyFromOrder(order);
-                const timestamp = order.timestamp;
-                const key = `${marketKey}:${timestamp}`;
+                const key = `${bar.marketKey}:${bar.timestamp}`;
                 const isNew = result[0] === 1;
 
                 if (isNew) newCount++;
 
                 const secondBar: SecondBar = {
-                    timestamp: timestamp,
-                    marketKey: marketKey,
+                    timestamp: bar.timestamp,
+                    marketKey: bar.marketKey,
                     open: result[1] as number,
                     high: (result[2] as number) || (result[1] as number),
                     low: (result[3] as number) || (result[1] as number),
@@ -163,11 +179,42 @@ export class AggregationService extends EventEmitter {
         // );
 
         const uniqueMarketKeys = new Set(orders.map(o => this.getMarketKeyFromOrder(o)));
-        for (const marketKey of uniqueMarketKeys) {
-            this.checkAndNotifyNewMarket(marketKey);
-        }
+        await Promise.all(Array.from(uniqueMarketKeys).map(marketKey => this.checkAndNotifyNewMarket(marketKey)));
 
         return results;
+    }
+
+    private aggregateOrdersBySecond(orders: OrderMatched[]): AggregatedOrderBar[] {
+        const barsByKey = new Map<string, AggregatedOrderBar>();
+
+        for (const order of orders) {
+            const marketKey = this.getMarketKeyFromOrder(order);
+            const timestamp = order.timestamp;
+            const key = `${marketKey}:${timestamp}`;
+            const current = barsByKey.get(key);
+
+            if (!current) {
+                barsByKey.set(key, {
+                    marketKey,
+                    timestamp,
+                    open: order.price,
+                    high: order.price,
+                    low: order.price,
+                    close: order.price,
+                    volume: order.size,
+                    tradeCount: 1,
+                });
+                continue;
+            }
+
+            current.high = Math.max(current.high, order.price);
+            current.low = Math.min(current.low, order.price);
+            current.close = order.price;
+            current.volume += order.size;
+            current.tradeCount += 1;
+        }
+
+        return Array.from(barsByKey.values());
     }
 
     /**

@@ -99,6 +99,59 @@ end
 `;
 
 /**
+ * Lua脚本：原子合并已经在内存聚合好的秒级K线
+ */
+export const UPSERT_AGGREGATED_SECOND_BAR_SCRIPT = `
+local key = KEYS[1]
+local open_price = tonumber(ARGV[1])
+local high_price = tonumber(ARGV[2])
+local low_price = tonumber(ARGV[3])
+local close_price = tonumber(ARGV[4])
+local volume = tonumber(ARGV[5])
+local trade_count = tonumber(ARGV[6])
+local timestamp = tonumber(ARGV[7])
+local current_time = tonumber(ARGV[8])
+
+local exists = redis.call('EXISTS', key)
+
+if exists == 0 then
+    redis.call('HMSET', key,
+        'open', open_price,
+        'high', high_price,
+        'low', low_price,
+        'close', close_price,
+        'volume', volume,
+        'timestamp', timestamp,
+        'tradeCount', trade_count,
+        'lastUpdate', current_time)
+    redis.call('EXPIRE', key, 86400)
+    return {1, open_price, high_price, low_price, close_price, volume, trade_count}
+else
+    local current_open = tonumber(redis.call('HGET', key, 'open'))
+    local current_high = tonumber(redis.call('HGET', key, 'high'))
+    local current_low = tonumber(redis.call('HGET', key, 'low'))
+    local current_volume = tonumber(redis.call('HGET', key, 'volume'))
+    local current_count = tonumber(redis.call('HGET', key, 'tradeCount'))
+    
+    local new_high = high_price > current_high and high_price or current_high
+    local new_low = low_price < current_low and low_price or current_low
+    local new_volume = current_volume + volume
+    local new_count = current_count + trade_count
+    
+    redis.call('HMSET', key,
+        'high', new_high,
+        'low', new_low,
+        'close', close_price,
+        'volume', new_volume,
+        'tradeCount', new_count,
+        'lastUpdate', current_time)
+    redis.call('EXPIRE', key, 86400)
+    
+    return {0, current_open, new_high, new_low, close_price, new_volume, new_count}
+end
+`;
+
+/**
  * 加载 Lua 脚本到 Redis（缓存 SHA）
  * 使用 defineCommand 方法（推荐）
  */
@@ -109,12 +162,19 @@ export const loadLuaScripts = async () => {
             numberOfKeys: 1,
             lua: UPSERT_SECOND_BAR_SCRIPT
         });
+        redisClient.defineCommand('upsertAggregatedSecondBar', {
+            numberOfKeys: 1,
+            lua: UPSERT_AGGREGATED_SECOND_BAR_SCRIPT
+        });
         
         logger.info('✅ Lua script registered: upsertSecondBar');
+        logger.info('✅ Lua script registered: upsertAggregatedSecondBar');
         
         // 可选：预加载脚本获取 SHA（用于性能监控）
         const sha1 = await redisClient.script('LOAD', UPSERT_SECOND_BAR_SCRIPT);
+        const aggregateSha1 = await redisClient.script('LOAD', UPSERT_AGGREGATED_SECOND_BAR_SCRIPT);
         logger.info(`Lua script SHA: ${sha1}`);
+        logger.info(`Aggregated Lua script SHA: ${aggregateSha1}`);
         
         return sha1;
     } catch (error) {

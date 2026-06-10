@@ -43,7 +43,51 @@ export interface SubscriptionMessage {
         /** Optional flag to enable custom features for the subscription */
         custom_feature_enabled?: boolean;
         assets_ids?: string[];
+        initial_dump?: boolean;
+        level?: number;
     }[];
+}
+
+/**
+ * Subscription request for the Polymarket CLOB market channel.
+ */
+export interface MarketSubscriptionMessage {
+    /** Asset IDs (token IDs) to subscribe to */
+    assets_ids: string[];
+
+    /** Market channel subscription type */
+    type: "market";
+
+    /** Dynamic market channel subscription operation */
+    operation?: "subscribe" | "unsubscribe";
+
+    /** Whether to send an initial orderbook snapshot on subscribe */
+    initial_dump?: boolean;
+
+    /** Orderbook depth level */
+    level?: number;
+
+    /** Optional flag to enable custom features */
+    custom_feature_enabled?: boolean;
+}
+
+export type WebSocketSubscriptionMessage = SubscriptionMessage | MarketSubscriptionMessage;
+
+export interface MarketPriceChange {
+    asset_id: string;
+    price: string;
+    size: string;
+    side: "BUY" | "SELL" | string;
+    hash: string;
+    best_bid: string;
+    best_ask: string;
+}
+
+export interface MarketPriceChangeMessage {
+    event_type: "price_change";
+    market: string;
+    price_changes: MarketPriceChange[];
+    timestamp: string;
 }
 
 /**

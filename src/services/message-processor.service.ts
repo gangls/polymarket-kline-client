@@ -19,6 +19,9 @@ export class MessageProcessor extends EventEmitter {
     // 批处理缓冲区
     private batchBuffer: OrderMatched[] = [];
     private batchTimer: NodeJS.Timeout | null = null;
+    private statsTimer: NodeJS.Timeout | null = null;
+    private flushInFlight = false;
+    private flushAgainRequested = false;
 
     // 统计信息
     private stats = {
@@ -31,8 +34,8 @@ export class MessageProcessor extends EventEmitter {
     constructor(config?: Partial<ProcessorConfig>) {
         super();
         this.config = {
-            batchSize: 100,
-            batchTimeoutMs: 100,
+            batchSize: 50000,
+            batchTimeoutMs: 1000,
             enableStreaming: true,
             ...config,
         };
@@ -58,6 +61,16 @@ export class MessageProcessor extends EventEmitter {
             logger.info(`New market detected: ${marketKey}`);
             // 向上抛出
             this.emit("new_market", marketKey);
+        });
+
+        this.client.on("new_up_down_event", event => {
+            logger.info(`New Up/Down event detected: ${event.eventSlug}`);
+            this.emit("new_up_down_event", event);
+        });
+
+        this.client.on("up_down_event_resolved", event => {
+            logger.info(`Up/Down event resolved: ${event.eventSlugs?.join(",") || "-"}`);
+            this.emit("up_down_event_resolved", event);
         });
 
         // WebSocket状态变化
@@ -95,41 +108,54 @@ export class MessageProcessor extends EventEmitter {
      * 刷新批处理缓冲区
      */
     private async flushBatch(): Promise<void> {
-        if (this.batchBuffer.length === 0) return;
-
-        // 清除定时器
-        if (this.batchTimer) {
-            clearTimeout(this.batchTimer);
-            this.batchTimer = null;
+        if (this.flushInFlight) {
+            this.flushAgainRequested = true;
+            return;
         }
 
-        const batch = [...this.batchBuffer];
-        this.batchBuffer = [];
-
-        // const startTime = Date.now();
+        this.flushInFlight = true;
 
         try {
-            // 批量聚合
-            const results = await this.aggregationService.batchProcessOrders(batch);
+            do {
+                this.flushAgainRequested = false;
 
-            this.stats.ordersProcessed += batch.length;
-            this.stats.batchesProcessed++;
-            this.stats.lastBatchTime = Date.now();
+                if (this.batchBuffer.length === 0) break;
 
-            // const processingTime = Date.now() - startTime;
+                // 清除定时器
+                if (this.batchTimer) {
+                    clearTimeout(this.batchTimer);
+                    this.batchTimer = null;
+                }
 
-            // logger.info(
-            //     `📦 Batch processed: ${batch.length} orders, ${results.size} bars updated in ${processingTime}ms`,
-            // );
+                const batch = this.batchBuffer;
+                this.batchBuffer = [];
 
-            // 发送实时更新事件（用于其他服务）
-            if (this.config.enableStreaming) {
-                this.emit("bars_updated", Array.from(results.values()));
+                try {
+                    // 批量聚合
+                    const results = await this.aggregationService.batchProcessOrders(batch);
+
+                    this.stats.ordersProcessed += batch.length;
+                    this.stats.batchesProcessed++;
+                    this.stats.lastBatchTime = Date.now();
+
+                    // 发送实时更新事件（用于其他服务）
+                    if (this.config.enableStreaming) {
+                        this.emit("bars_updated", Array.from(results.values()));
+                    }
+                } catch (error) {
+                    logger.error("Failed to process batch:", error);
+                    // 失败时重新加入缓冲区
+                    this.batchBuffer.unshift(...batch);
+                    break;
+                }
+            } while (this.flushAgainRequested || this.batchBuffer.length >= this.config.batchSize);
+        } finally {
+            this.flushInFlight = false;
+            if (this.batchBuffer.length > 0 && !this.batchTimer) {
+                this.batchTimer = setTimeout(() => {
+                    this.flushBatch();
+                }, this.config.batchTimeoutMs);
             }
-        } catch (error) {
-            logger.error("Failed to process batch:", error);
-            // 失败时重新加入缓冲区
-            this.batchBuffer.unshift(...batch);
         }
     }
 
@@ -143,10 +169,13 @@ export class MessageProcessor extends EventEmitter {
         await this.client.connect();
 
         // 定期输出统计
-        setInterval(() => {
+        if (this.statsTimer) {
+            clearInterval(this.statsTimer);
+        }
+        this.statsTimer = setInterval(() => {
             const stats = this.getStats();
             logger.info(
-                `Stats: Received=${stats.ordersReceived} Processed=${stats.ordersProcessed} Batches=${stats.batchesProcessed} Buffer=${stats.bufferSize}`,
+                `Stats: Received=${stats.ordersReceived} Processed=${stats.ordersProcessed} Batches=${stats.batchesProcessed} Buffer=${stats.bufferSize} Flush=${stats.flushInFlight}`,
             );
         }, 60000);
 
@@ -164,6 +193,10 @@ export class MessageProcessor extends EventEmitter {
 
         // 断开连接
         this.client.disconnect();
+        if (this.statsTimer) {
+            clearInterval(this.statsTimer);
+            this.statsTimer = null;
+        }
 
         logger.info("✅ Message Processor stopped");
     }
@@ -175,6 +208,7 @@ export class MessageProcessor extends EventEmitter {
         return {
             ...this.stats,
             bufferSize: this.batchBuffer.length,
+            flushInFlight: this.flushInFlight,
             cacheStats: this.aggregationService.getStats(),
             wsStatus: this.client.getStatus(),
         };
