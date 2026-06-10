@@ -14,7 +14,11 @@ const DEFAULT_POLYMARKET_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws
 const DEFAULT_SUBSCRIPTION_BATCH_SIZE = 20;
 const DEFAULT_DISCOVERY_REFRESH_MS = 60_000;
 const DEFAULT_ASSET_PARTITIONS: AssetPartition[] = [
-    { id: "btc", label: "BTC", assetTagIds: ["235"] },
+    { id: "btc-5m", label: "BTC-5M", assetTagIds: ["235"], intervalTagIds: ["102892"] },
+    { id: "btc-15m", label: "BTC-15M", assetTagIds: ["235"], intervalTagIds: ["102467"] },
+    { id: "btc-1h", label: "BTC-1H", assetTagIds: ["235"], intervalTagIds: ["102175"] },
+    { id: "btc-4h", label: "BTC-4H", assetTagIds: ["235"], intervalTagIds: ["102531"] },
+    { id: "btc-daily", label: "BTC-Daily", assetTagIds: ["235"], intervalTagIds: ["102281"] },
     { id: "eth", label: "ETH", assetTagIds: ["39"] },
     { id: "sol", label: "SOL", assetTagIds: ["818"] },
     { id: "xrp", label: "XRP", assetTagIds: ["101267"] },
@@ -27,6 +31,7 @@ interface AssetPartition {
     id: string;
     label: string;
     assetTagIds: string[];
+    intervalTagIds?: string[];
 }
 
 interface ClientConfig {
@@ -63,6 +68,7 @@ interface ClientContext {
     id: string;
     label: string;
     assetTagIds: string[];
+    intervalTagIds?: string[];
     client: RealTimeDataClient | null;
     status: ConnectionStatus;
     reconnectAttempts: number;
@@ -283,7 +289,10 @@ export class PolymarketClientService extends EventEmitter {
         context.refreshInFlight = true;
 
         try {
-            const discoveryService = new MarketDiscoveryService({ assetTagIds: context.assetTagIds });
+            const discoveryService = new MarketDiscoveryService({
+                assetTagIds: context.assetTagIds,
+                ...(context.intervalTagIds ? { intervalTagIds: context.intervalTagIds } : {}),
+            });
             const markets = await discoveryService.discoverCryptoUpDownMarkets();
             const nextAssetMetadata = this.createAssetMetadataIndex(markets);
             const nextAssetIds = new Set(nextAssetMetadata.keys());
@@ -407,6 +416,7 @@ export class PolymarketClientService extends EventEmitter {
                 eventSlug,
                 partition: context.id,
                 assetTagIds: context.assetTagIds,
+                intervalTagIds: context.intervalTagIds,
                 assetIds: market?.assetIds ?? [],
                 conditionId: market?.conditionId,
                 title: market?.question,
@@ -557,12 +567,14 @@ export class PolymarketClientService extends EventEmitter {
                 id: "all",
                 label: "ALL",
                 assetTagIds: parseCsv(process.env.MARKET_ASSET_TAG_IDS, DEFAULT_ASSET_PARTITIONS.flatMap(partition => partition.assetTagIds)),
+                intervalTagIds: parseCsv(process.env.MARKET_INTERVAL_TAG_IDS, []),
             }];
 
         return partitions.map(partition => ({
             id: partition.id,
             label: partition.label,
             assetTagIds: partition.assetTagIds,
+            intervalTagIds: partition.intervalTagIds,
             client: null,
             status: ConnectionStatus.DISCONNECTED,
             reconnectAttempts: 0,
@@ -634,16 +646,24 @@ function parseAssetPartitions(value: string | undefined): AssetPartition[] {
         .map(item => item.trim())
         .filter(Boolean)
         .map(item => {
-            const [id, label, assetTagIds] = item.split(":");
+            const [id, label, assetTagIds, intervalTagIds] = item.split(":");
             return {
                 id: id || "",
                 label: label || id || "",
-                assetTagIds: parseCsv(assetTagIds, []),
+                assetTagIds: parsePartitionTags(assetTagIds),
+                intervalTagIds: parsePartitionTags(intervalTagIds),
             };
         })
         .filter(partition => partition.id && partition.assetTagIds.length > 0);
 
     return parsed.length > 0 ? parsed : DEFAULT_ASSET_PARTITIONS;
+}
+
+function parsePartitionTags(value: string | undefined): string[] {
+    return (value || "")
+        .split("+")
+        .map(item => item.trim())
+        .filter(Boolean);
 }
 
 function parseCsv(value: string | undefined, fallback: string[]): string[] {
