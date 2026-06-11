@@ -40,6 +40,8 @@ interface ClientConfig {
     host?: string;
     subscriptionBatchSize: number;
     discoveryRefreshMs: number;
+    connectStaggerMs: number;
+    reconnectJitterMs: number;
     initialDump: boolean;
     splitByAsset: boolean;
     assetPartitions: AssetPartition[];
@@ -99,6 +101,8 @@ export class PolymarketClientService extends EventEmitter {
                 DEFAULT_SUBSCRIPTION_BATCH_SIZE,
             ),
             discoveryRefreshMs: Number(process.env.MARKET_DISCOVERY_REFRESH_MS) || DEFAULT_DISCOVERY_REFRESH_MS,
+            connectStaggerMs: Number(process.env.WS_CONNECT_STAGGER_MS) || 1000,
+            reconnectJitterMs: Number(process.env.WS_RECONNECT_JITTER_MS) || 5000,
             initialDump: process.env.MARKET_SUBSCRIPTION_INITIAL_DUMP === "true",
             splitByAsset,
             assetPartitions,
@@ -115,7 +119,12 @@ export class PolymarketClientService extends EventEmitter {
             `Connecting to Polymarket WebSocket partitions: ${this.contexts.map(context => context.label).join(",")}`,
         );
         this.updateOverallStatus();
-        await Promise.all(this.contexts.map(context => this.connectContext(context)));
+        for (const [index, context] of this.contexts.entries()) {
+            if (index > 0 && this.config.connectStaggerMs > 0) {
+                await delay(this.config.connectStaggerMs);
+            }
+            await this.connectContext(context);
+        }
         this.emit("connected");
     }
 
@@ -447,8 +456,13 @@ export class PolymarketClientService extends EventEmitter {
 
     private mapPriceChangesToOrders(context: ClientContext, message: MarketPriceChangeMessage): OrderMatched[] {
         const timestamp = Math.floor(Number(message.timestamp || Date.now()) / 1000);
+        const latestPriceByAsset = new Map<string, MarketPriceChangeMessage["price_changes"][number]>();
 
-        return message.price_changes.flatMap(change => {
+        for (const change of message.price_changes) {
+            latestPriceByAsset.set(change.asset_id, change);
+        }
+
+        return Array.from(latestPriceByAsset.values()).flatMap(change => {
             const metadata = context.assetMetadataById.get(change.asset_id);
             if (!metadata) {
                 logger.debug(`[${context.label}] Skipping price_change for unsubscribed asset_id=${change.asset_id}`);
@@ -505,10 +519,14 @@ export class PolymarketClientService extends EventEmitter {
     private async reconnect(context: ClientContext): Promise<void> {
         context.reconnectAttempts++;
         const reconnectAttempt = context.reconnectAttempts;
-        const delay = Math.min(1000 * Math.pow(2, context.reconnectAttempts), 30000);
+        const baseDelay = Math.min(1000 * Math.pow(2, context.reconnectAttempts), 30000);
+        const jitter = this.config.reconnectJitterMs > 0
+            ? Math.floor(Math.random() * this.config.reconnectJitterMs)
+            : 0;
+        const delayMs = baseDelay + jitter;
 
         logger.info(
-            `[${context.label}] Reconnecting in ${delay}ms... (Attempt ${context.reconnectAttempts}/${this.maxReconnectAttempts})`,
+            `[${context.label}] Reconnecting in ${delayMs}ms... (Attempt ${context.reconnectAttempts}/${this.maxReconnectAttempts})`,
         );
         context.status = ConnectionStatus.RECONNECTING;
         this.updateOverallStatus();
@@ -521,7 +539,7 @@ export class PolymarketClientService extends EventEmitter {
                 logger.error(`[${context.label}] Reconnection failed:`, error);
                 this.handleDisconnect(context);
             }
-        }, delay);
+        }, delayMs);
     }
 
     /**
@@ -638,6 +656,10 @@ function chunk<T>(items: T[], size: number): T[][] {
         chunks.push(items.slice(index, index + size));
     }
     return chunks;
+}
+
+function delay(ms: number): Promise<void> {
+    return new Promise(resolve => setTimeout(resolve, ms));
 }
 
 function parseAssetPartitions(value: string | undefined): AssetPartition[] {
