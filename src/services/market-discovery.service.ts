@@ -14,6 +14,7 @@ const CURRENT_WINDOW_LOOKBACK_MS = 5 * 60 * 60 * 1000;
 const CURRENT_WINDOW_LOOKAHEAD_MS = 70 * 60 * 1000;
 const HOURLY_ASSET_SLUGS = ["bitcoin", "ethereum", "solana", "xrp", "dogecoin", "hype", "bnb"];
 const DAILY_UP_DOWN_ASSET_SLUGS = ["bitcoin", "ethereum", "solana", "xrp", "dogecoin", "hype", "bnb"];
+const DEFAULT_EVENTS_CACHE_TTL_MS = 15_000;
 
 export interface DiscoveredMarket {
     id?: string;
@@ -85,6 +86,7 @@ interface GammaEvent {
 
 export class MarketDiscoveryService {
     private readonly config: MarketDiscoveryConfig;
+    private static readonly eventsCache = new Map<string, { expiresAt: number; eventsPromise: Promise<GammaEvent[]> }>();
 
     constructor(config?: Partial<MarketDiscoveryConfig>) {
         this.config = {
@@ -158,6 +160,29 @@ export class MarketDiscoveryService {
     }
 
     private async fetchEvents(): Promise<GammaEvent[]> {
+        const cacheKey = this.eventsCacheKey();
+        const cacheTtlMs = Number(process.env.MARKET_DISCOVERY_EVENTS_CACHE_TTL_MS) || DEFAULT_EVENTS_CACHE_TTL_MS;
+        if (cacheTtlMs > 0) {
+            const cached = MarketDiscoveryService.eventsCache.get(cacheKey);
+            if (cached && cached.expiresAt > Date.now()) {
+                return cached.eventsPromise;
+            }
+
+            const eventsPromise = this.fetchEventsUncached().catch(error => {
+                MarketDiscoveryService.eventsCache.delete(cacheKey);
+                throw error;
+            });
+            MarketDiscoveryService.eventsCache.set(cacheKey, {
+                expiresAt: Date.now() + cacheTtlMs,
+                eventsPromise,
+            });
+            return eventsPromise;
+        }
+
+        return this.fetchEventsUncached();
+    }
+
+    private async fetchEventsUncached(): Promise<GammaEvent[]> {
         const eventsByKey = new Map<string, GammaEvent>();
         let totalPageCount = 0;
         for (const queryTagId of this.config.queryTagIds) {
@@ -230,6 +255,19 @@ export class MarketDiscoveryService {
             `Fetched ${events.length} active Gamma events across ${totalPageCount} pages for market discovery queryTags=${this.config.queryTagIds.join(",")}`,
         );
         return events;
+    }
+
+    private eventsCacheKey(): string {
+        return JSON.stringify({
+            gammaEventsUrl: this.config.gammaEventsUrl,
+            pageSize: this.config.pageSize,
+            maxEvents: this.config.maxEvents,
+            apiLive: this.config.apiLive,
+            currentOnly: this.config.currentOnly,
+            queryTagIds: this.config.queryTagIds,
+            hourlySlugDiscovery: this.config.hourlySlugDiscovery,
+            dailySlugDiscovery: this.config.dailySlugDiscovery,
+        });
     }
 
     private async fetchHourlyEventsBySlug(): Promise<GammaEvent[]> {

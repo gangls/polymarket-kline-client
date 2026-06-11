@@ -5,7 +5,7 @@ import {
     Message,
 } from "../polymarket-websocket";
 import { EventEmitter } from "events";
-import { MarketPriceChangeMessage, MarketSubscriptionMessage } from "../polymarket-websocket/model";
+import { LastTradePriceMessage, MarketPriceChangeMessage, MarketSubscriptionMessage } from "../polymarket-websocket/model";
 import { OrderMatched, OrderMatchedMessage, ConnectionStatus } from "../models/types";
 import { DiscoveredMarket, MarketDiscoveryService } from "./market-discovery.service";
 import { logger } from "../utils/logger";
@@ -41,6 +41,7 @@ interface ClientConfig {
     subscriptionBatchSize: number;
     discoveryRefreshMs: number;
     connectStaggerMs: number;
+    connectConcurrency: number;
     reconnectJitterMs: number;
     initialDump: boolean;
     splitByAsset: boolean;
@@ -96,12 +97,10 @@ export class PolymarketClientService extends EventEmitter {
             autoReconnect: true,
             pingInterval: 5000,
             host: process.env.POLYMARKET_WS_URL || DEFAULT_POLYMARKET_WS_URL,
-            subscriptionBatchSize: Math.min(
-                Number(process.env.MARKET_SUBSCRIPTION_BATCH_SIZE) || DEFAULT_SUBSCRIPTION_BATCH_SIZE,
-                DEFAULT_SUBSCRIPTION_BATCH_SIZE,
-            ),
+            subscriptionBatchSize: Number(process.env.MARKET_SUBSCRIPTION_BATCH_SIZE) || DEFAULT_SUBSCRIPTION_BATCH_SIZE,
             discoveryRefreshMs: Number(process.env.MARKET_DISCOVERY_REFRESH_MS) || DEFAULT_DISCOVERY_REFRESH_MS,
             connectStaggerMs: Number(process.env.WS_CONNECT_STAGGER_MS) || 1000,
+            connectConcurrency: Number(process.env.WS_CONNECT_CONCURRENCY) || 4,
             reconnectJitterMs: Number(process.env.WS_RECONNECT_JITTER_MS) || 5000,
             initialDump: process.env.MARKET_SUBSCRIPTION_INITIAL_DUMP === "true",
             splitByAsset,
@@ -119,13 +118,28 @@ export class PolymarketClientService extends EventEmitter {
             `Connecting to Polymarket WebSocket partitions: ${this.contexts.map(context => context.label).join(",")}`,
         );
         this.updateOverallStatus();
-        for (const [index, context] of this.contexts.entries()) {
-            if (index > 0 && this.config.connectStaggerMs > 0) {
-                await delay(this.config.connectStaggerMs);
-            }
-            await this.connectContext(context);
-        }
+        await this.connectContexts();
         this.emit("connected");
+    }
+
+    private async connectContexts(): Promise<void> {
+        const concurrency = Math.max(1, Math.min(this.config.connectConcurrency, this.contexts.length));
+        let nextIndex = 0;
+
+        const worker = async (): Promise<void> => {
+            while (true) {
+                const index = nextIndex++;
+                const context = this.contexts[index];
+                if (!context) return;
+
+                if (index > 0 && this.config.connectStaggerMs > 0) {
+                    await delay(this.config.connectStaggerMs * Math.floor(index / concurrency));
+                }
+                await this.connectContext(context);
+            }
+        };
+
+        await Promise.all(Array.from({ length: concurrency }, () => worker()));
     }
 
     private connectContext(context: ClientContext): Promise<void> {
@@ -232,9 +246,12 @@ export class PolymarketClientService extends EventEmitter {
             // 只处理 orders_matched 消息
             if (isRealtimeMessage(message) && message.topic === "activity" && message.type === "orders_matched") {
                 const orderMessage = message as OrderMatchedMessage;
-                this.emit("order_matched", orderMessage.payload);
+                const order = this.normalizeMatchedOrder(context, orderMessage.payload);
+                if (!order) return;
+
+                this.emit("order_matched", order);
                 logger.debug(
-                    `📥 Order received: ${orderMessage.payload.slug} ${orderMessage.payload.outcome} @ ${orderMessage.payload.price}`,
+                    `📥 Order received: ${order.slug} ${order.outcome} @ ${order.price}`,
                 );
                 return;
             }
@@ -247,6 +264,17 @@ export class PolymarketClientService extends EventEmitter {
 
                 logger.debug(
                     `📥 Price changes mapped: market=${message.market} changes=${message.price_changes.length} orders=${orders.length}`,
+                );
+                return;
+            }
+
+            if (isLastTradePriceMessage(message)) {
+                const order = this.mapLastTradePriceToOrder(context, message);
+                if (!order) return;
+
+                this.emit("order_matched", order);
+                logger.debug(
+                    `📥 Last trade price mapped: market=${message.market} asset=${message.asset_id} price=${message.price}`,
                 );
                 return;
             }
@@ -454,23 +482,67 @@ export class PolymarketClientService extends EventEmitter {
         context.refreshTimer = null;
     }
 
-    private mapPriceChangesToOrders(context: ClientContext, message: MarketPriceChangeMessage): OrderMatched[] {
-        const timestamp = Math.floor(Number(message.timestamp || Date.now()) / 1000);
-        const latestPriceByAsset = new Map<string, MarketPriceChangeMessage["price_changes"][number]>();
-
-        for (const change of message.price_changes) {
-            latestPriceByAsset.set(change.asset_id, change);
+    private normalizeMatchedOrder(context: ClientContext, payload: OrderMatched): OrderMatched | null {
+        const record = payload as Partial<OrderMatched> & { asset_id?: string };
+        const assetId = record.asset || record.asset_id;
+        if (!assetId) {
+            logger.warn(`[${context.label}] Skipping orders_matched without asset id:`, payload);
+            return null;
         }
 
-        return Array.from(latestPriceByAsset.values()).flatMap(change => {
+        const metadata = context.assetMetadataById.get(assetId);
+        if (!metadata) {
+            logger.debug(`[${context.label}] Skipping orders_matched for unsubscribed asset_id=${assetId}`);
+            return null;
+        }
+
+        const price = Number(record.price);
+        const size = Number(record.size);
+        const timestamp = Number(record.timestamp);
+        if (!Number.isFinite(price) || !Number.isFinite(size) || !Number.isFinite(timestamp)) {
+            logger.warn("Skipping invalid orders_matched payload:", payload);
+            return null;
+        }
+
+        return {
+            asset: metadata.assetId,
+            bio: record.bio || "",
+            conditionId: record.conditionId || metadata.conditionId,
+            eventSlug: record.eventSlug || metadata.eventSlug,
+            icon: record.icon || "",
+            name: record.name || "",
+            outcome: metadata.outcome,
+            outcomeIndex: metadata.outcomeIndex,
+            price,
+            profileImage: record.profileImage || "",
+            proxyWallet: record.proxyWallet || "",
+            pseudonym: record.pseudonym || "",
+            side: record.side === "SELL" ? "SELL" : "BUY",
+            size,
+            slug: metadata.slug,
+            timestamp,
+            title: record.title || metadata.title,
+            transactionHash: record.transactionHash || "",
+        };
+    }
+
+    private mapPriceChangesToOrders(context: ClientContext, message: MarketPriceChangeMessage): OrderMatched[] {
+        const timestamp = Math.floor(Number(message.timestamp || Date.now()) / 1000);
+
+        return message.price_changes.flatMap(change => {
             const metadata = context.assetMetadataById.get(change.asset_id);
             if (!metadata) {
                 logger.debug(`[${context.label}] Skipping price_change for unsubscribed asset_id=${change.asset_id}`);
                 return [];
             }
 
-            const price = Number(change.price);
+            const lastTradePrice = getLastTradePrice(change);
+            const price = lastTradePrice;
             const size = Number(change.size);
+            if (price === null) {
+                logger.debug(`[${context.label}] Skipping price_change without last trade price asset_id=${change.asset_id}`);
+                return [];
+            }
             if (!Number.isFinite(price) || !Number.isFinite(size)) {
                 logger.warn("Skipping invalid price_change:", change);
                 return [];
@@ -497,6 +569,43 @@ export class PolymarketClientService extends EventEmitter {
                 transactionHash: change.hash,
             } satisfies OrderMatched];
         });
+    }
+
+    private mapLastTradePriceToOrder(context: ClientContext, message: LastTradePriceMessage): OrderMatched | null {
+        const metadata = context.assetMetadataById.get(message.asset_id);
+        if (!metadata) {
+            logger.debug(`[${context.label}] Skipping last_trade_price for unsubscribed asset_id=${message.asset_id}`);
+            return null;
+        }
+
+        const price = Number(message.price);
+        const size = Number(message.size);
+        const timestampMs = Number(message.timestamp || Date.now());
+        if (!Number.isFinite(price) || !Number.isFinite(size) || !Number.isFinite(timestampMs)) {
+            logger.warn("Skipping invalid last_trade_price payload:", message);
+            return null;
+        }
+
+        return {
+            asset: metadata.assetId,
+            bio: "",
+            conditionId: metadata.conditionId || message.market,
+            eventSlug: metadata.eventSlug,
+            icon: "",
+            name: "",
+            outcome: metadata.outcome,
+            outcomeIndex: metadata.outcomeIndex,
+            price,
+            profileImage: "",
+            proxyWallet: "",
+            pseudonym: "",
+            side: message.side === "SELL" ? "SELL" : "BUY",
+            size,
+            slug: metadata.slug,
+            timestamp: Math.floor(timestampMs / 1000),
+            title: metadata.title,
+            transactionHash: message.transaction_hash || "",
+        };
     }
 
     /**
@@ -640,6 +749,18 @@ function isMarketPriceChangeMessage(value: unknown): value is MarketPriceChangeM
     );
 }
 
+function isLastTradePriceMessage(value: unknown): value is LastTradePriceMessage {
+    if (!value || typeof value !== "object") return false;
+    const record = value as Record<string, unknown>;
+    return (
+        record.event_type === "last_trade_price" &&
+        typeof record.asset_id === "string" &&
+        typeof record.market === "string" &&
+        typeof record.price === "string" &&
+        typeof record.size === "string"
+    );
+}
+
 function isMarketResolvedMessage(value: unknown): value is MarketResolvedMessage {
     if (!value || typeof value !== "object") return false;
     const record = value as Record<string, unknown>;
@@ -648,6 +769,14 @@ function isMarketResolvedMessage(value: unknown): value is MarketResolvedMessage
         typeof record.market === "string" &&
         Array.isArray(record.assets_ids)
     );
+}
+
+function getLastTradePrice(change: MarketPriceChangeMessage["price_changes"][number]): number | null {
+    const value = change.last_trade_price ?? change.lastTradePrice ?? change.last_traded_price;
+    if (value === undefined || value === "") return null;
+
+    const price = Number(value);
+    return Number.isFinite(price) ? price : null;
 }
 
 function chunk<T>(items: T[], size: number): T[][] {

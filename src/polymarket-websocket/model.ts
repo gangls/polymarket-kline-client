@@ -81,6 +81,9 @@ export interface MarketPriceChange {
     hash: string;
     best_bid: string;
     best_ask: string;
+    last_trade_price?: string;
+    lastTradePrice?: string;
+    last_traded_price?: string;
 }
 
 export interface MarketPriceChangeMessage {
@@ -88,6 +91,18 @@ export interface MarketPriceChangeMessage {
     market: string;
     price_changes: MarketPriceChange[];
     timestamp: string;
+}
+
+export interface LastTradePriceMessage {
+    event_type: "last_trade_price";
+    asset_id: string;
+    market: string;
+    price: string;
+    size: string;
+    fee_rate_bps?: string;
+    side: "BUY" | "SELL" | string;
+    timestamp: string;
+    transaction_hash?: string;
 }
 
 /**
